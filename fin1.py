@@ -56,7 +56,7 @@ try:
 except Exception:
     pass
 
-st.set_page_config(page_title="Quantum Portfolio Optimizer — Cloud Friendly", layout="wide")
+st.set_page_config(page_title="Quantum Portfolio Optimizer", layout="wide")
 
 # PARAMETERS 
 MAX_ASSETS_UI = 50
