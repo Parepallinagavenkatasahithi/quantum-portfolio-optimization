@@ -207,7 +207,7 @@ start_date = st.sidebar.date_input("📅 Start date", pd.to_datetime("2023-01-01
 end_date = st.sidebar.date_input("📅 End date", pd.to_datetime("today"))
 reps = st.sidebar.slider("QAOA depth (p)", 1, 3, 1)
 
-st.title("💹 Stock Portfolio Optimizer (Cloud Friendly)")
+st.title("💹 Stock Portfolio Optimizer")
 
 if len(selected_assets) < 2:
     st.error("Select at least 2 assets.")
