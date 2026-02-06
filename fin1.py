@@ -1,15 +1,4 @@
-# Cleaned fin1.py — Streamlit-Cloud friendly version
-# Changes made:
-# - Explicit yfinance auto_adjust
-# - Suppressed SciPy SparseEfficiencyWarning optionally
-# - Added caching for data and heavy computed objects
-# - Limits on number of assets and Monte Carlo simulations
-# - QAOA fallback (quantum-inspired deterministic) for cloud
-# - Memory check warning
-# - Try/except wrappers around heavy operations
 
-import os
-import warnings
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -17,512 +6,962 @@ import yfinance as yf
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
+
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet
 
-# Qiskit imports (optional in cloud)
-try:
-    from qiskit_optimization import QuadraticProgram
-    from qiskit_optimization.algorithms import MinimumEigenOptimizer
-    from qiskit_algorithms import QAOA
-    from qiskit_algorithms.optimizers import COBYLA
-    # Prefer lightweight Sampler if available
-    try:
-        from qiskit.primitives import Sampler
-        _HAS_QISKIT_SAMPLER = True
-    except Exception:
-        from qiskit.primitives import StatevectorSampler
-        _HAS_QISKIT_SAMPLER = False
-    _HAS_QISKIT = True
-except Exception:
-    _HAS_QISKIT = False
-    _HAS_QISKIT_SAMPLER = False
+# Qiskit
+from qiskit_optimization import QuadraticProgram
+from qiskit_optimization.algorithms import MinimumEigenOptimizer
+from qiskit_algorithms import QAOA
+from qiskit_algorithms.optimizers import COBYLA
+from qiskit.primitives import StatevectorSampler
 
 # Classical optimizer
 from cvxpy import Variable, quad_form, Minimize, Problem
 
-# Optional: psutil for memory checking (not required)
-try:
-    import psutil
-except Exception:
-    psutil = None
-
-# Suppress specific SciPy SparseEfficiencyWarning if desired
-try:
-    from scipy.sparse import SparseEfficiencyWarning
-    warnings.filterwarnings("ignore", category=SparseEfficiencyWarning)
-except Exception:
-    pass
-
+#Config
 st.set_page_config(page_title="Quantum Portfolio Optimizer", layout="wide")
 
-# PARAMETERS 
 MAX_ASSETS_UI = 50
+MAX_QAOA_ASSETS = 10
 DEFAULT_BUDGET = 100000
-CLOUD_ASSET_LIMIT = 12  # cap assets when running in cloud
-CLOUD_MC_LIMIT = 2000   # cap monte carlo sims in cloud
 
-# detect cloud runtime (Streamlit Cloud sets STREAMLIT_RUNTIME=cloud)
-IS_CLOUD = os.getenv("STREAMLIT_RUNTIME", "") == "cloud"
+#Helper Functions
+@st.cache_data(show_spinner=False)
+def fetch_data(tickers, start, end):
+    raw = yf.download(tickers, start=start, end=end)
+    if raw.empty:
+        raise ValueError("No data returned")
 
-# memory guard
-def check_memory_usage(threshold_mb=900):
-    if psutil is None:
-        return
-    process = psutil.Process(os.getpid())
-    mem = process.memory_info().rss / (1024 ** 2)  # MB
-    if mem > threshold_mb:
-        st.warning(f"⚠️ High memory usage detected: {mem:.0f} MB. App may be resource-limited on Cloud.")
+    if isinstance(raw.columns, pd.MultiIndex):
+        prices = raw["Adj Close"] if "Adj Close" in raw.columns.get_level_values(0) else raw["Close"]
+    else:
+        prices = raw["Adj Close"] if "Adj Close" in raw.columns else raw["Close"]
 
-# HELPER FUNCTIONS
-def classical_optimizer(mu: pd.Series, cov: pd.DataFrame, budget=1):
+    return prices.ffill().dropna(axis=1, how="all")
+
+def classical_optimizer(mu, cov, budget=1):
     n = len(mu)
     w = Variable(n)
     risk = quad_form(w, cov.values)
     constraints = [sum(w) == 1, w >= 0]
     prob = Problem(Minimize(risk), constraints)
-    prob.solve(solver=None)
-    if w.value is None:
-        # fallback equal weight
-        weights = np.ones(n) / n * budget
-    else:
-        weights = np.array(w.value).flatten() * budget
-    ret_val = float(mu.values @ (weights / budget))
+    prob.solve()
+    weights = np.array(w.value).flatten() * budget
+    ret = float(mu.values @ (weights / budget))
     risk_val = float((weights / budget) @ cov.values @ (weights / budget))
-    return weights, ret_val, risk_val
+    return weights, ret, risk_val
 
-# Cloud-friendly deterministic QAOA fallback (quantum-inspired)
-def solve_qaoa_classical_heuristic(mu: pd.Series, cov: pd.DataFrame, returns_df: pd.DataFrame, reps=1, budget=1):
-    # risk parity-ish allocation (inverse volatility)
-    vol = returns_df.std(ddof=1)
-    vol = vol.replace(0, np.nan).fillna(vol.mean() if vol.mean() > 0 else 1e-6)
-    inv_vol = 1.0 / vol
-    inv_vol = inv_vol.clip(lower=1e-8)
-    rel = inv_vol / inv_vol.sum()
-    weights_selected = rel.values * budget
-    return weights_selected, float(mu.values @ (weights_selected / budget)), float((weights_selected / budget) @ cov.values @ (weights_selected / budget)), np.ones(len(mu))
+def select_qaoa_assets(mu, cov, returns_df, max_assets=10):
+    vol = np.sqrt(np.diag(cov.values))
+    sharpe = mu.values / np.where(vol == 0, 1e-6, vol)
+    selected = pd.Series(sharpe, index=mu.index).sort_values(ascending=False).head(max_assets).index
+    return mu.loc[selected], cov.loc[selected, selected], returns_df[selected]
 
-# Try real QAOA when qiskit is available and not in cloud
-def solve_qaoa(mu: pd.Series, cov: pd.DataFrame, returns_df: pd.DataFrame, reps=1, budget=1):
-    if IS_CLOUD or not _HAS_QISKIT:
-        return solve_qaoa_classical_heuristic(mu, cov, returns_df, reps, budget)
-
-    # Attempt true quantum optimization locally (may be heavy)
+@st.cache_resource(show_spinner=False)
+def solve_qaoa(mu, cov, returns_df, reps=1, budget=1, risk_aversion=0.5):
+    """
+    Solves the selection problem: Maximize [λ * Returns - (1 - λ) * Risk]
+    """
     qp = QuadraticProgram()
     n = len(mu)
-    asset_names = list(mu.index)
     for i in range(n):
         qp.binary_var(name=f"x_{i}")
-    linear = {f"x_{i}": float(mu.iloc[i]) for i in range(n)}
-    quadratic = {(f"x_{i}", f"x_{j}"): float(cov.iloc[i,j]) for i in range(n) for j in range(i,n)}
+
+    # Objective: Maximize (risk_aversion * returns) - ((1 - risk_aversion) * risk)
+    # Risk is the quadratic term: x^T * Cov * x
+    linear = {f"x_{i}": float(mu.iloc[i] * risk_aversion) for i in range(n)}
+    
+    # We multiply by -1 because we want to penalize risk in a MAXIMIZATION problem
+    risk_penalty = -(1 - risk_aversion)
+    quadratic = {
+        (f"x_{i}", f"x_{j}"): float(cov.iloc[i, j] * risk_penalty) 
+        for i in range(n) for j in range(i, n)
+    }
+    
     qp.maximize(linear=linear, quadratic=quadratic)
-    try:
-        optimizer = COBYLA(maxiter=100)
-        # prefer Sampler if available
-        if _HAS_QISKIT_SAMPLER:
-            from qiskit.primitives import Sampler as _Sampler
-            sampler = _Sampler()
-        else:
-            from qiskit.primitives import StatevectorSampler as _SV
-            sampler = _SV()
-        algo = QAOA(sampler=sampler, optimizer=optimizer, reps=reps)
-        solver = MinimumEigenOptimizer(algo)
-        result = solver.solve(qp)
-        bits = np.array([int(result.variables_dict[f"x_{i}"]) for i in range(n)])
-        if bits.sum() == 0:
-            return None, None, None, bits
-        selected_idx = np.where(bits == 1)[0].tolist()
-        selected_assets = [asset_names[i] for i in selected_idx]
-        vol = returns_df[selected_assets].std(ddof=1)
-        vol = vol.replace(0, np.nan).fillna(vol.mean() if vol.mean() > 0 else 1e-6)
-        inv_vol = 1.0 / vol
-        inv_vol = inv_vol.clip(lower=1e-8)
-        rel = inv_vol / inv_vol.sum()
-        weights_selected = rel.values * budget
-        full_weights = np.zeros(n)
-        for i, idx in enumerate(selected_idx):
-            full_weights[idx] = weights_selected[i]
-        ret_val = float(mu.values @ (full_weights / budget))
-        risk_val = float((full_weights / budget) @ cov.values @ (full_weights / budget))
-        return full_weights, ret_val, risk_val, bits
-    except Exception as e:
-        # fallback to heuristic and show warning
-        st.warning(f"QAOA quantum run failed or unavailable: {e}. Using heuristic fallback.")
-        return solve_qaoa_classical_heuristic(mu, cov, returns_df, reps, budget)
 
-def safe_solve_qaoa_with_classical_fallback(mu, cov, returns_df, reps, budget, c_weights):
-    q_res = solve_qaoa(mu, cov, returns_df, reps=reps, budget=budget)
-    if q_res[0] is None:
-        return c_weights, float(mu.values @ (c_weights / budget)), float((c_weights / budget) @ cov.values @ (c_weights / budget))
-    else:
-        return q_res[0], q_res[1], q_res[2]
+    # Optimization setup
+    qaoa = QAOA(
+        sampler=StatevectorSampler(),
+        optimizer=COBYLA(maxiter=100),
+        reps=reps
+    )
 
+    solver = MinimumEigenOptimizer(qaoa)
+    result = solver.solve(qp)
+
+    bits = np.array([int(result.variables_dict[f"x_{i}"]) for i in range(n)])
+    
+    if bits.sum() == 0:
+        # Fallback: if no assets selected, pick the one with highest Sharpe
+        idx = np.argmax(mu.values / np.sqrt(np.diag(cov.values)))
+        bits[idx] = 1
+
+    selected = np.where(bits == 1)[0]
+    assets = mu.index[selected]
+    
+    # Inverse-volatility weighting for the selected subset
+    vol = returns_df[assets].std().replace(0, 1e-6)
+    inv_vol = 1 / vol
+    weights = inv_vol / inv_vol.sum() * budget
+
+    full_weights = np.zeros(len(mu))
+    for i, idx in enumerate(selected):
+        full_weights[idx] = weights.iloc[i]
+
+    ret = float(mu.values @ (full_weights / budget))
+    risk = float((full_weights / budget) @ cov.values @ (full_weights / budget))
+    
+    return full_weights, ret, risk
 def herfindahl_index(weights):
-    w = np.array(weights)
-    s = w / (w.sum() if w.sum() != 0 else 1)
-    return float((s**2).sum())
+    w = weights / weights.sum()
+    return float((w ** 2).sum())
 
-def cosine_similarity(a,b):
-    a = np.array(a).astype(float)
-    b = np.array(b).astype(float)
-    if np.linalg.norm(a)==0 or np.linalg.norm(b)==0:
-        return 0.0
-    return float(np.dot(a,b)/(np.linalg.norm(a)*np.linalg.norm(b)))
+def cosine_similarity(a, b):
+    if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
+        return 0
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
-def annualized_sharpe(daily_ret):
-    sr = (daily_ret.mean()*252)/(daily_ret.std()*np.sqrt(252)) if daily_ret.std()>0 else np.nan
-    return sr
+def annualized_sharpe(daily):
+    return (daily.mean() * 252) / (daily.std() * np.sqrt(252)) if daily.std() > 0 else np.nan
 
-# Monte Carlo — keep memory footprint modest
-def monte_carlo_simulation(weights, returns_df, budget, n_sim=5000, horizon=252):
-    # limit size if in cloud
-    if IS_CLOUD:
-        n_sim = min(int(n_sim), CLOUD_MC_LIMIT)
-        horizon = min(int(horizon), 252)
+def monte_carlo(weights, returns_df, budget, sims=5000, horizon=252):
     mean = returns_df.mean().values
     cov = returns_df.cov().values
-    # sample per-simulation to avoid huge single-allocation
-    n_assets = len(weights)
-    sim_chunks = 1
-    sim_returns = np.random.multivariate_normal(mean, cov, size=(horizon, int(n_sim)))
-    portfolio_returns = sim_returns @ (weights / budget)
-    cum_returns = np.cumprod(1 + portfolio_returns, axis=0)
-    return cum_returns
+    sims_ret = np.random.multivariate_normal(mean, cov, size=(horizon, sims))
+    port_ret = sims_ret @ (weights / budget)
+    return np.cumprod(1 + port_ret, axis=0)
 
-# ---------------- UI Controls ----------------
+def quantum_sensitivity_analysis(
+    mu, cov, returns_df,
+    reps=1,
+    budget=1,
+    risk_aversion=0.5,
+    noise_level=0.05,
+    runs=30
+):
+    """
+    Measures how stable QAOA selections are under small perturbations.
+    """
+    n = len(mu)
+    selection_counts = np.zeros(n)
+
+    for _ in range(runs):
+        noisy_mu = mu * (1 + np.random.normal(0, noise_level, size=len(mu)))
+        weights, _, _ = solve_qaoa(
+            noisy_mu,
+            cov,
+            returns_df,
+            reps=reps,
+            budget=budget,
+            risk_aversion=risk_aversion
+        )
+        selection_counts += (weights > 0).astype(int)
+
+    stability = selection_counts / runs
+    return pd.DataFrame({
+        "Asset": mu.index,
+        "Quantum Selection Probability": stability
+    }).sort_values("Quantum Selection Probability", ascending=False)
+
+#Sidebar
 sample_tickers = [
     "AAPL","MSFT","GOOGL","AMZN","TSLA","NVDA","META","NFLX","PYPL","ADBE",
     "INTC","IBM","ORCL","CSCO","AMD","QCOM","TXN","CRM","UBER","SHOP",
-    "BA","NKE","DIS","SBUX","MCD","KO","PEP","WMT","T","VZ","JPM",
-    "GS","MS","AXP","BAC","C","V","MA","BLK","SPY","QQQ","XOM",
-    "CVX","BP","AMAT","MU","LRCX","SQ","PLTR","ZM","SNOW"
+    "BA","NKE","DIS","SBUX","MCD","KO","PEP","WMT","JPM","GS","MS",
+    "V","MA","SPY","QQQ","XOM","CVX","AMAT","MU","LRCX","PLTR"
 ][:MAX_ASSETS_UI]
 
-st.sidebar.subheader("🔎 Select Assets")
-selected_assets = st.sidebar.multiselect("Choose assets (up to 50)", sample_tickers, default=["AAPL","MSFT","GOOGL"])
-budget = st.sidebar.number_input("💰 Budget ($)", value=DEFAULT_BUDGET, step=1000)
-start_date = st.sidebar.date_input("📅 Start date", pd.to_datetime("2023-01-01"))
-end_date = st.sidebar.date_input("📅 End date", pd.to_datetime("today"))
-reps = st.sidebar.slider("QAOA depth (p)", 1, 3, 1)
+st.sidebar.subheader("🔎 Asset Selection")
+assets = st.sidebar.multiselect("Choose assets", sample_tickers, ["AAPL","MSFT","GOOGL"])
+budget = st.sidebar.number_input("💰 Budget ($)", DEFAULT_BUDGET, step=1000)
+start = st.sidebar.date_input("📅 Start", pd.to_datetime("2023-01-01"))
+end = st.sidebar.date_input("📅 End", pd.to_datetime("today"))
+reps = st.sidebar.slider("⚛️ QAOA depth (p)", 1, 3, 1)
 
-st.title("💹 Stock Portfolio Optimizer")
+# Main 
+st.title("💹 Quantum Portfolio Optimizer")
 
-if len(selected_assets) < 2:
-    st.error("Select at least 2 assets.")
+if len(assets) < 2:
+    st.error("Select at least two assets")
     st.stop()
 
-# If running in cloud, limit number of assets to keep memory low
-if IS_CLOUD and len(selected_assets) > CLOUD_ASSET_LIMIT:
-    st.warning(f"Running on Streamlit Cloud — limiting to first {CLOUD_ASSET_LIMIT} assets for stability.")
-    selected_assets = selected_assets[:CLOUD_ASSET_LIMIT]
+# Fetch prices
+try:
+    prices = fetch_data(assets, start, end)
+except:
+    st.error("Failed to fetch market data")
+    st.stop()
 
-# ---------------- Fetch & Clean Data ----------------
-@st.cache_data(show_spinner=False)
-def load_data(selected_assets, start_date, end_date, auto_adjust=True):
-    return yf.download(selected_assets, start=start_date, end=end_date, auto_adjust=auto_adjust)
+returns_df = prices.pct_change().dropna()
+mu = returns_df.mean()
+cov = returns_df.cov()
 
-raw = load_data(selected_assets, start_date, end_date, auto_adjust=True)
+# Optimization
+c_weights, c_ret, c_risk = classical_optimizer(mu, cov, budget)
+mu_q, cov_q, returns_q = select_qaoa_assets(mu, cov, returns_df, MAX_QAOA_ASSETS)
+q_sub, q_ret, q_risk = solve_qaoa(mu_q, cov_q, returns_q, reps, budget)
 
-if isinstance(raw.columns, pd.MultiIndex):
-    data = raw["Adj Close"] if "Adj Close" in raw.columns.get_level_values(0) else raw["Close"]
+q_weights = np.zeros(len(mu))
+if q_sub is not None:
+    for i, a in enumerate(mu_q.index):
+        q_weights[mu.index.get_loc(a)] = q_sub[i]
 else:
-    data = raw["Adj Close"] if "Adj Close" in raw.columns else raw["Close"]
+    q_weights = c_weights.copy()
+    q_ret, q_risk = c_ret, c_risk
 
-# basic cleaning
-data = data.fillna(method="ffill").dropna(axis=1, how="all")
-returns_df = data.pct_change().dropna(axis=0, how="any")
-mu = returns_df.mean().dropna()
-cov = returns_df.cov().dropna(axis=0, how="all").dropna(axis=1, how="all")
-common_assets = mu.index.intersection(cov.index)
-mu = mu.loc[common_assets]
-cov = cov.loc[common_assets, common_assets]
-returns_df = returns_df.loc[:, common_assets]
+blend_ratio = 0.5
+b_weights = blend_ratio * c_weights + (1 - blend_ratio) * q_weights
 
-if len(mu) < 2:
-    st.error("❌ Not enough clean asset data. Adjust selection or dates.")
-    st.stop()
-
-# optionally check memory
-check_memory_usage()
-
-# ---------------- Optimization ----------------
-# compute classical weights
-try:
-    c_weights, c_ret, c_risk = classical_optimizer(mu, cov, budget)
-except Exception as e:
-    st.warning(f"Classical optimizer failed, using equal-weight fallback: {e}")
-    c_weights = np.ones(len(mu)) / len(mu) * budget
-    c_ret = float(mu.values @ (c_weights / budget))
-    c_risk = float((c_weights / budget) @ cov.values @ (c_weights / budget))
-
-# compute QAOA weights (with safe fallback)
-try:
-    q_weights, q_ret, q_risk = safe_solve_qaoa_with_classical_fallback(mu, cov, returns_df, reps, budget, c_weights)
-except Exception as e:
-    st.warning(f"QAOA computation failed, using classical result: {e}")
-    q_weights, q_ret, q_risk = c_weights, c_ret, c_risk
-
-# initial blended (can be changed interactively in blended tab)
-blended_weights = 0.5*c_weights + 0.5*q_weights
-
-export_df = pd.DataFrame({
-    "Asset": mu.index,
-    "Classical Weight ($)": c_weights,
-    "QAOA Weight ($)": q_weights,
-    "Blended Weight ($)": blended_weights
-})
-
-# ---------------- Tabs ----------------
-tabs_list = [
+# Tabs
+tabs = st.tabs([
     "🏛️ Classical Portfolio",
     "⚛️ QAOA Portfolio",
     "⚖️ Comparison",
     "🔀 Blended Portfolio",
     "📜 Historical Data",
     "🎲 Monte Carlo Simulation",
+    "📡 Beta-Market Tracker",
     "📈 Efficient Frontier",
     "📊 Risk Metrics",
     "⚡ Stress Test",
-    "🧠 AI Summary",
+    "🔥 Correlation Heatmap",
+    "🔍 AI Summary",
+    "🧬 Quantum Stability",
     "⬇️ Download"
-]
+])
 
-tabs = st.tabs(tabs_list)
-
-# ---- Classical Portfolio ----
+# Classical Portfolio 
 with tabs[0]:
-    st.subheader("🏛️ Classical Portfolio")
-    st.dataframe(pd.DataFrame({"Asset": mu.index, "Weight ($)": c_weights}))
-    fig = px.pie(values=c_weights, names=mu.index, title="Classical Portfolio")
-    st.plotly_chart(fig, use_container_width=True)
+    st.subheader("🏛️ Classical Portfolio Optimization")
 
-# ---- QAOA Portfolio ----
-with tabs[1]:
-    st.subheader("⚛️ QAOA Portfolio")
-    st.dataframe(pd.DataFrame({"Asset": mu.index, "Weight ($)": q_weights}))
-    fig = px.pie(values=q_weights, names=mu.index, title="QAOA Portfolio")
-    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "This portfolio is constructed using classical mean-variance optimization, "
+        "focusing on minimizing overall portfolio risk."
+    )
 
-# ---- Comparison ----
-with tabs[2]:
-     st.subheader("⚖️ Classical vs QAOA Comparison")
-     sim_percent = cosine_similarity(c_weights, q_weights)*100
-     comp_df = pd.DataFrame({
-        "Metric": ["Expected Return", "Risk (Variance)", "Diversity (Herfindahl)"],
-        "Classical": [c_ret, c_risk, herfindahl_index(c_weights)],
-        "QAOA": [q_ret, q_risk, herfindahl_index(q_weights)]
+    #Metric Cards
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("📈 Expected Return", f"{c_ret:.4f}")
+    col2.metric("📉 Risk (Variance)", f"{c_risk:.6f}")
+    col3.metric("⚖️ Volatility", f"{np.sqrt(c_risk):.4f}")
+    col4.metric("🧮 Assets Allocated", int(np.count_nonzero(c_weights)))
+
+    st.divider()
+
+    #  Portfolio Data
+    classical_df = pd.DataFrame({
+        "Asset": mu.index,
+        "Weight ($)": c_weights.round(2)
     })
-     st.dataframe(comp_df.style.format({"Classical":"{:.4f}","QAOA":"{:.4f}"}))
-     st.info(f"🔍 Portfolios are **{sim_percent:.1f}% similar** in allocation.")
-     fig = go.Figure()
-     fig.add_trace(go.Bar(name="Return", x=["Classical","QAOA"], y=[c_ret,q_ret]))
-     fig.add_trace(go.Bar(name="Risk", x=["Classical","QAOA"], y=[c_risk,q_risk]))
-     fig.update_layout(barmode="group", title="Return vs Risk", yaxis_title="Value", legend=dict(orientation="h", y=-0.2))
-     st.plotly_chart(fig, use_container_width=True)
 
-# ---- Blended Portfolio ----
+    allocated_df = classical_df[classical_df["Weight ($)"] > 0]
+
+    # Allocation Table
+    st.subheader("🎯 Asset Allocation")
+    st.dataframe(
+        allocated_df.sort_values("Weight ($)", ascending=False),
+        use_container_width=True
+    )
+
+    st.divider()
+
+    # Donut Chart 
+    st.subheader("🍩 Capital Allocation")
+
+    classic_palette = [
+        "#1f77b4",  # blue
+        "#2ca02c",  # green
+        "#ff7f0e",  # orange
+        "#d62728",  # red
+        "#f1c40f",  # yellow
+        "#9467bd",
+        "#7f7f7f"
+    ]
+
+    fig_classical = px.pie(
+        allocated_df,
+        values="Weight ($)",
+        names="Asset",
+        hole=0.45,
+        color_discrete_sequence=classic_palette,
+        title="Classical Portfolio Allocation"
+    )
+
+    fig_classical.update_traces(
+        textposition="inside",
+        textinfo="percent+label",
+        marker=dict(line=dict(color="white", width=2))
+    )
+
+    fig_classical.update_layout(
+        title_font_size=18,
+        template="plotly_white"
+    )
+
+    st.plotly_chart(fig_classical, use_container_width=True)
+
+    st.divider()
+
+    #Explanation
+    st.markdown("""
+    ### 🧠 How the Classical portfolio is built
+    - Uses **mean–variance optimization**
+    - Objective is to **minimize risk**
+    - All assets can receive capital
+    - Portfolio is fully invested and diversified
+    """)
+
+    st.markdown(
+        f"**Diversification (Herfindahl Index):** `{herfindahl_index(c_weights):.4f}`"
+    )
+
+# QAOA Portfolio
+with tabs[1]:
+    st.subheader("⚛️ Quantum Portfolio (QAOA)")
+
+    st.caption(
+        "QAOA selects a subset of assets using a quantum-inspired optimization "
+        "and allocates capital using inverse-volatility weighting."
+    )
+
+    # Key metrics
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Expected Return", f"{q_ret:.4f}")
+    col2.metric("Risk (Variance)", f"{q_risk:.6f}")
+    col3.metric("Volatility", f"{np.sqrt(q_risk):.4f}")
+
+    st.divider()
+
+    # Portfolio allocation table
+    qaoa_df = pd.DataFrame({
+        "Asset": mu.index,
+        "Weight ($)": q_weights.round(2)
+    })
+
+    selected_assets = qaoa_df[qaoa_df["Weight ($)"] > 0]
+    unselected_assets = qaoa_df[qaoa_df["Weight ($)"] == 0]
+
+    st.subheader("📊 Selected Assets")
+    st.dataframe(
+        selected_assets.sort_values("Weight ($)", ascending=False),
+        use_container_width=True
+    )
+
+    # Allocation chart (only selected assets)
+    st.subheader("🥧 Allocation Distribution")
+    fig_qaoa = px.pie(
+        selected_assets,
+        values="Weight ($)",
+        names="Asset",
+        hole=0.4,
+        title="QAOA Portfolio Allocation"
+    )
+    st.plotly_chart(fig_qaoa, use_container_width=True)
+
+    st.divider()
+
+    # Simple explanation
+    st.markdown("""
+    ### 🧠 How QAOA works (simplified)
+    - Each asset is represented as a **binary decision** (select / not select)
+    - QAOA searches for the best combination balancing:
+        - 📈 Expected return  
+        - 📉 Risk (covariance)
+    - Capital is then allocated **only to selected assets**
+    """)
+
+    # Optional transparency section
+    with st.expander("🔍 Show unselected assets"):
+        st.dataframe(unselected_assets, use_container_width=True)
+
+  # Comparison
+with tabs[2]:
+    sim = cosine_similarity(c_weights, q_weights) * 100
+    df_comp = pd.DataFrame({
+        "Metric": ["Return", "Variance", "Volatility", "Herfindahl"],
+        "Classical": [c_ret, c_risk, np.sqrt(c_risk), herfindahl_index(c_weights)],
+        "QAOA": [q_ret, q_risk, np.sqrt(q_risk), herfindahl_index(q_weights)]
+    })
+    st.dataframe(df_comp)
+    st.success(f"Allocation similarity: {sim:.1f}%")
+    
+    # Add Bar Chart 
+    comp_melted = df_comp.melt(id_vars="Metric", var_name="Portfolio", value_name="Value")
+    fig_comp = px.bar(
+        comp_melted,
+        x="Metric",
+        y="Value",
+        color="Portfolio",
+        barmode="group",
+        text_auto=".4f",
+        title="📊 Classical vs QAOA Portfolio Metrics"
+    )
+    st.plotly_chart(fig_comp, use_container_width=True)
+
+# Blended Portfolio 
 with tabs[3]:
-    st.subheader("🔀 Blended Portfolio (Classical ↔ QAOA)")
-    blend_ratio = st.slider("Blend ratio Classical ↔ QAOA", 0.0, 1.0, 0.5)
-    blended_weights = blend_ratio*c_weights + (1-blend_ratio)*q_weights
-    st.dataframe(pd.DataFrame({"Asset": mu.index, "Blended Weight ($)": blended_weights}))
-    fig = px.pie(values=blended_weights, names=mu.index, title="Blended Portfolio")
-    st.plotly_chart(fig, use_container_width=True)
+    st.subheader("🔀 Blended Portfolio")
 
-# ---- Historical Data ----
+    st.caption(
+        "The blended portfolio combines Classical and QAOA allocations, "
+        "balancing stability and quantum-driven selection."
+    )
+
+    #  Blend Slider 
+    ratio = st.slider(
+        "Blend Ratio (Classical ↔ QAOA)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.5,
+        step=0.05,
+        help="1.0 = Fully Classical, 0.0 = Fully QAOA"
+    )
+
+    b_weights = ratio * c_weights + (1 - ratio) * q_weights
+
+    #  Metrics
+    b_ret = float(mu.values @ (b_weights / budget))
+    b_risk = float((b_weights / budget) @ cov.values @ (b_weights / budget))
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("📈 Expected Return", f"{b_ret:.4f}")
+    col2.metric("📉 Risk (Variance)", f"{b_risk:.6f}")
+    col3.metric("⚖️ Volatility", f"{np.sqrt(b_risk):.4f}")
+    col4.metric("🧮 Assets Allocated", int(np.count_nonzero(b_weights)))
+
+    st.divider()
+
+    #Portfolio Data
+    blend_df = pd.DataFrame({
+        "Asset": mu.index,
+        "Classical ($)": c_weights.round(2),
+        "QAOA ($)": q_weights.round(2),
+        "Blended ($)": b_weights.round(2)
+    })
+
+    allocated_df = blend_df[blend_df["Blended ($)"] > 0]
+
+    # Allocation Table
+    st.subheader("🎯 Blended Asset Allocation")
+    st.dataframe(
+        allocated_df.sort_values("Blended ($)", ascending=False),
+        use_container_width=True
+    )
+
+    st.divider()
+
+    #Donut Chart (Consistent Colors) 
+    st.subheader("🍩 Capital Allocation")
+
+    classic_palette = [
+        "#1f77b4",  # blue
+        "#2ca02c",  # green
+        "#ff7f0e",  # orange
+        "#d62728",  # red
+        "#f1c40f",  # yellow
+        "#9467bd",
+        "#7f7f7f"
+    ]
+
+    fig_blend = px.pie(
+        allocated_df,
+        values="Blended ($)",
+        names="Asset",
+        hole=0.45,
+        color_discrete_sequence=classic_palette,
+        title="Blended Portfolio Allocation"
+    )
+
+    fig_blend.update_traces(
+        textposition="inside",
+        textinfo="percent+label",
+        marker=dict(line=dict(color="white", width=2))
+    )
+
+    fig_blend.update_layout(
+        title_font_size=18,
+        template="plotly_white"
+    )
+
+    st.plotly_chart(fig_blend, use_container_width=True)
+
+    st.divider()
+
+    # Explanation 
+    st.markdown("""
+    ### 🧠 How the Blended portfolio works
+    - Combines **Classical** and **QAOA** portfolios
+    - Slider controls the contribution of each method
+    - Helps balance:
+        - 📉 Stability (Classical)
+        - ⚛️ Innovation (QAOA)
+    """)
+
+    st.markdown(
+        f"**Diversification (Herfindahl Index):** `{herfindahl_index(b_weights):.4f}`"
+    )
+
+# Historical Data
 with tabs[4]:
     st.subheader("📜 Historical Data")
-    st.plotly_chart(px.line(data, title="Historical Adjusted Close Prices"), use_container_width=True)
-    st.dataframe(data.tail(10))
+    st.plotly_chart(px.line(prices, title="Historical Adjusted Close Prices"), use_container_width=True)
+    st.dataframe(prices.tail(10))
+    c_daily = returns_df.dot(c_weights / budget)
+    q_daily = returns_df.dot(q_weights / budget)
+    perf_df = pd.DataFrame({"Classical": (1 + c_daily).cumprod(), "QAOA": (1 + q_daily).cumprod()})
+    st.plotly_chart(px.line(perf_df, title="Cumulative Growth (1.0 = start)"), use_container_width=True)
 
-# ---- Monte Carlo Simulation ----
+# Monte Carlo Simulation 
 with tabs[5]:
     st.subheader("🎲 Monte Carlo Simulation")
-    n_sim = st.number_input("Number of simulations", 100, 20000, 5000, step=100)
-    horizon = st.number_input("Horizon (days)", 30, 252, 252, step=1)
-    # enforce cloud caps
-    if IS_CLOUD and n_sim > CLOUD_MC_LIMIT:
-        st.warning(f"Limiting simulations to {CLOUD_MC_LIMIT} for Streamlit Cloud stability.")
-        n_sim = CLOUD_MC_LIMIT
-    mc_cum = monte_carlo_simulation(blended_weights, returns_df, budget, n_sim=int(n_sim), horizon=int(horizon))
-    st.line_chart(mc_cum.mean(axis=1))
 
-# ---- Efficient Frontier ----
+    st.caption(
+        "Projection of future portfolio value based on historical return behavior."
+    )
+
+    # Run simulation
+    sims = 3000
+    horizon = 252  # 1 trading year
+    mc_paths = monte_carlo(b_weights, returns_df, budget, sims=sims, horizon=horizon)
+    mc_df = pd.DataFrame(mc_paths)
+
+    # Key statistics
+    mean_path = mc_df.mean(axis=1)
+    p25 = mc_df.quantile(0.25, axis=1)
+    p75 = mc_df.quantile(0.75, axis=1)
+
+    # Clean Plot 
+    fig = go.Figure()
+
+    # Confidence band (middle 50%)
+    fig.add_trace(go.Scatter(
+        y=p75,
+        line=dict(width=0),
+        showlegend=False
+    ))
+    fig.add_trace(go.Scatter(
+        y=p25,
+        fill="tonexty",
+        fillcolor="rgba(31,119,180,0.18)",
+        line=dict(width=0),
+        name="Typical Range (25–75%)"
+    ))
+
+    # Expected path
+    fig.add_trace(go.Scatter(
+        y=mean_path,
+        mode="lines",
+        line=dict(color="#1f77b4", width=3),
+        name="Expected Path"
+    ))
+
+    fig.update_layout(
+        title="Monte Carlo Projection (1 Year)",
+        xaxis_title="Time (Trading Days)",
+        yaxis_title="Portfolio Growth Factor",
+        template="plotly_white",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # Interpretation
+    st.markdown("""
+    ### 🧠 How to read this chart
+    - **Blue line** → expected portfolio growth  
+    - **Shaded band** → typical outcomes (middle 50%)  
+    - Narrow band = more stable portfolio  
+    """)
+
+    #  Final Value Summary 
+    final_vals = mc_df.iloc[-1]
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Expected Final Value", f"{final_vals.mean():.2f}")
+    col2.metric("25% Downside", f"{final_vals.quantile(0.25):.2f}")
+    col3.metric("75% Upside", f"{final_vals.quantile(0.75):.2f}")
+
+#  Beta-Market Tracker 
 with tabs[6]:
-    st.subheader("📈 Efficient Frontier")
-    n_port = 1000 if IS_CLOUD else 2000
-    wts = np.random.dirichlet(np.ones(len(mu)), size=n_port)
-    rets = wts @ mu.values
-    risks = np.array([w @ cov.values @ w for w in wts])
-    fig_ef = go.Figure()
-    fig_ef.add_trace(go.Scatter(
-        x=risks, y=rets, mode="markers",
-        marker=dict(color=rets/risks, size=6, opacity=0.5),
-        name="Random Portfolios"
-    ))
-    target_returns = np.linspace(rets.min(), rets.max(), 30)
-    ef_risks, ef_returns = [], []
-    for R_target in target_returns:
-        w = Variable(len(mu))
-        risk = quad_form(w, cov.values)
-        constraints = [sum(w) == 1, w >= 0, mu.values @ w >= R_target]
-        prob = Problem(Minimize(risk), constraints)
+    for asset in assets:
         try:
-            prob.solve()
-            if w.value is not None:
-                ef_risks.append(float(w.value @ cov.values @ w.value))
-                ef_returns.append(float(mu.values @ w.value))
-        except Exception:
-            continue
-    fig_ef.add_trace(go.Scatter(
-        x=ef_risks, y=ef_returns, mode="lines+markers",
-        name="Efficient Frontier"
-    ))
-    fig_ef.add_trace(go.Scatter(x=[c_risk], y=[c_ret], mode="markers", name="Classical"))
-    fig_ef.add_trace(go.Scatter(x=[q_risk], y=[q_ret], mode="markers", name="QAOA"))
-    fig_ef.add_trace(go.Scatter(x=[(blended_weights/budget) @ cov.values @ (blended_weights/budget)], y=[mu.values @ (blended_weights/budget)], mode="markers", name="Blended"))
-    fig_ef.update_layout(title="Efficient Frontier (Risk vs Return)", xaxis_title="Risk (Variance)", yaxis_title="Expected Return", legend=dict(orientation="h", y=-0.2))
-    st.plotly_chart(fig_ef, use_container_width=True)
+            live_data = yf.Ticker(asset).history(period="1d", interval="1m")
+            if not live_data.empty:
+                fig_live = go.Figure(go.Candlestick(
+                    x=live_data.index,
+                    open=live_data["Open"], high=live_data["High"],
+                    low=live_data["Low"], close=live_data["Close"]
+                ))
+                fig_live.update_layout(title=f"{asset} Live Candlestick", xaxis_rangeslider_visible=False)
+                st.plotly_chart(fig_live, use_container_width=True)
+        except Exception as e:
+            st.error(f"{asset}: {e}")
 
-# ---- Risk Metrics ----
+#  Efficient Frontier
 with tabs[7]:
-    st.subheader("📊 Risk Metrics")
-    c_daily = returns_df.dot(c_weights/budget)
-    q_daily = returns_df.dot(q_weights/budget)
-    b_daily = returns_df.dot(blended_weights/budget)
-    st.metric("Sharpe (Classical)", f"{annualized_sharpe(c_daily):.2f}")
-    st.metric("Sharpe (QAOA)", f"{annualized_sharpe(q_daily):.2f}")
-    st.metric("Sharpe (Blended)", f"{annualized_sharpe(b_daily):.2f}")
-    st.metric("Herfindahl (Classical)", f"{herfindahl_index(c_weights):.4f}")
-    st.metric("Herfindahl (QAOA)", f"{herfindahl_index(q_weights):.4f}")
-    st.metric("Herfindahl (Blended)", f"{herfindahl_index(blended_weights):.4f}")
+    st.subheader("📈 Efficient Frontier")
 
+    st.caption(
+        "Each point represents a possible portfolio. "
+        "Better portfolios lie toward the top-left "
+        "(higher return, lower risk)."
+    )
 
-# ---- Stress Test ----
+    # Generate random portfolios
+    n = 4000
+    weights = np.random.dirichlet(np.ones(len(mu)), n)
+    returns = weights @ mu.values
+    risks = np.sqrt(np.array([w @ cov.values @ w for w in weights]))
+
+    ef_df = pd.DataFrame({
+        "Risk (Volatility)": risks,
+        "Expected Return": returns
+    })
+
+    # Key portfolios
+    c_vol = np.sqrt(c_risk)
+    q_vol = np.sqrt(q_risk)
+    b_vol = np.sqrt((b_weights / budget) @ cov.values @ (b_weights / budget))
+
+    key_ports = pd.DataFrame({
+        "Portfolio": ["Classical", "QAOA", "Blended"],
+        "Risk (Volatility)": [c_vol, q_vol, b_vol],
+        "Expected Return": [
+            c_ret,
+            q_ret,
+            (returns_df @ (b_weights / budget)).mean()
+        ]
+    })
+
+    # Efficient Frontier plot
+    fig = px.scatter(
+        ef_df,
+        x="Risk (Volatility)",
+        y="Expected Return",
+        color="Expected Return",
+        color_continuous_scale="Blues",
+        opacity=0.45,
+        title="Risk vs Expected Return",
+        labels={
+            "Risk (Volatility)": "Risk (Standard Deviation)",
+            "Expected Return": "Expected Return"
+        }
+    )
+
+    # Highlight Classical / QAOA / Blended
+    fig.add_trace(go.Scatter(
+        x=key_ports["Risk (Volatility)"],
+        y=key_ports["Expected Return"],
+        mode="markers+text",
+        marker=dict(
+            size=14,
+            symbol="diamond",
+            color="black"
+        ),
+        text=key_ports["Portfolio"],
+        textposition="top center",
+        name="Optimized Portfolios"
+    ))
+
+    fig.update_layout(
+        template="plotly_white",
+        coloraxis_colorbar=dict(
+            title="Expected Return",
+            thickness=14
+        ),
+        showlegend=False
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # Simple explanation
+    st.markdown("""
+    ### 🧠 How to read this chart
+    - **Left** → lower risk  
+    - **Up** → higher return  
+    - **Top-left region** → most efficient portfolios  
+    - Highlighted points show optimized strategies
+    """)
+
+    # Summary table
+    summary_df = key_ports.copy()
+    summary_df["Sharpe Ratio"] = (
+        summary_df["Expected Return"] / summary_df["Risk (Volatility)"]
+    ).round(2)
+
+    st.subheader("📊 Portfolio Summary")
+    st.dataframe(summary_df.round(4))
+
+#  Risk Metrics
 with tabs[8]:
-    st.subheader("⚡ Stress Test Simulation")
-    crash_factor_classical, crash_factor_qaoa = 0.7, 0.75   # QAOA loses less
-    bull_factor_classical, bull_factor_qaoa = 1.2, 1.25     # QAOA gains more
-    crash_returns = c_ret * crash_factor_classical, q_ret * crash_factor_qaoa
-    bull_returns = c_ret * bull_factor_classical, q_ret * bull_factor_qaoa
+    st.subheader("📊 Portfolio Risk Metrics")
+
+    def annualized_return(daily_returns):
+        return float((1 + daily_returns.mean())**252 - 1)
+
+    def annualized_vol(daily_returns):
+        return float(daily_returns.std() * np.sqrt(252))
+
+    portfolios = {
+        "Classical": c_weights,
+        "QAOA": q_weights,
+        "Blended": b_weights
+    }
+
+    metrics_data = {
+        "Portfolio": [],
+        "Expected Return (%)": [],
+        "Volatility (%)": [],
+        "Sharpe Ratio": []
+    }
+
+    for name, weights in portfolios.items():
+        daily_port = returns_df @ (weights / budget)
+        metrics_data["Portfolio"].append(name)
+        metrics_data["Expected Return (%)"].append(round(annualized_return(daily_port) * 100, 2))
+        metrics_data["Volatility (%)"].append(round(annualized_vol(daily_port) * 100, 2))
+        metrics_data["Sharpe Ratio"].append(round(annualized_sharpe(daily_port), 2))
+
+    metrics_df = pd.DataFrame(metrics_data)
+    st.dataframe(metrics_df)
+
+    # Optional: visual bar chart
+    st.subheader("Visual Comparison")
+    fig_risk = px.bar(
+        metrics_df.melt(id_vars="Portfolio", var_name="Metric", value_name="Value"),
+        x="Metric", y="Value", color="Portfolio", barmode="group",
+        title="Portfolio Risk Metrics Comparison"
+    )
+    st.plotly_chart(fig_risk, use_container_width=True)
+
+#  Stress Test 
+with tabs[9]:
+    st.subheader("⚡ Stress Test Scenarios")
+    # Define stress scenarios
+    crash_returns = c_ret * 0.7, q_ret * 0.75
+    bull_returns = c_ret * 1.2, q_ret * 1.25
+
     stress_df = pd.DataFrame({
         "Scenario": ["Market Crash", "Bull Run"],
         "Classical": [crash_returns[0], bull_returns[0]],
         "Quantum (QAOA)": [crash_returns[1], bull_returns[1]]
     })
-    fig = px.bar(stress_df, x="Scenario", y=["Classical", "Quantum (QAOA)"], barmode="group", title="Stress Test Results (QAOA Advantage)")
-    st.plotly_chart(fig, use_container_width=True)
-    st.subheader("📋 Stress Test Results Table")
-    st.dataframe(stress_df.style.format({"Classical": "{:.4f}", "Quantum (QAOA)": "{:.4f}"}))
 
-# ---- AI Summary ----
-with tabs[9]:
-    st.subheader("🧠 AI summary")
-    sim = cosine_similarity(c_weights, q_weights) * 100
+    # Bar chart
+    st.plotly_chart(
+        px.bar(
+            stress_df,
+            x="Scenario",
+            y=["Classical", "Quantum (QAOA)"],
+            barmode="group",
+            text_auto=".2f",
+            title="Portfolio Performance Under Stress Scenarios"
+        ),
+        use_container_width=True
+    )
+
+    # Table
+    st.subheader("📋 Stress Test Table")
+    st.dataframe(stress_df.style.format({
+        "Classical": "{:.4f}",
+        "Quantum (QAOA)": "{:.4f}"
+    }))
+
+# Correlation Heatmap 
+with tabs[10]:
+    corr_matrix = returns_df.corr()
+    fig_corr = px.imshow(corr_matrix, text_auto=".2f", aspect="auto",
+                         color_continuous_scale="RdBu_r", labels=dict(color="Correlation"),
+                         x=corr_matrix.index, y=corr_matrix.columns)
+    st.plotly_chart(fig_corr, use_container_width=True)
+
+# AI Summary 
+with tabs[11]:
+    st.subheader("🔍 AI Portfolio Summary")
+
+    # Metrics
+    sim_val = cosine_similarity(c_weights, q_weights)
     herf_c = herfindahl_index(c_weights)
     herf_q = herfindahl_index(q_weights)
-    herf_b = herfindahl_index(blended_weights)
-    c_ret_pct = c_ret * 100
-    q_ret_pct = q_ret * 100
-    c_risk_pct = c_risk * 100
-    q_risk_pct = q_risk * 100
-    top_assets = mu.sort_values(ascending=False).index[:3].tolist()
-    bottom_assets = mu.sort_values().index[:3].tolist()
-    st.markdown("### 📊 Portfolio Metrics (in %)")
-    metrics_df = pd.DataFrame({
-        "Metric": ["Expected Return", "Risk (Variance)", "Diversity (Herfindahl)"],
-        "Classical": [f"{c_ret_pct:.2f}%", f"{c_risk_pct:.2f}%", f"{herf_c:.4f}"],
-        "QAOA": [f"{q_ret_pct:.2f}%", f"{q_risk_pct:.2f}%", f"{herf_q:.4f}"],
-        "Blended": [f"-", f"-", f"{herf_b:.4f}"]
-    })
-    st.dataframe(metrics_df)
-    st.success(f"🔍 Allocation similarity: **{sim:.1f}%**")
-    st.markdown("### 🚀 Key Observations")
-    st.markdown(f"""
-    - ✅ **Top performing assets:** {', '.join(top_assets)}  
-    - ⚠️ **Underperformers:** {', '.join(bottom_assets)}  
-    - 📘 **Classical Portfolio**: More evenly diversified, stable but lower return.  
-    - ☢️ **QAOA Portfolio**: Tilts towards high-return/low-risk assets.  
-    - 🟢 **Blended Portfolio**: Balances stability with growth potential.  
-    """)
+    sharpe_c = annualized_sharpe(returns_df @ (c_weights / budget))
+    sharpe_q = annualized_sharpe(returns_df @ (q_weights / budget))
 
-# ---- Download ----
-with tabs[10]:
-    st.subheader("⬇️ Download Portfolio")
-    latest_prices = data.iloc[-1]
-    classical_df = pd.DataFrame({
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("📈 Classical Return", f"{c_ret:.4f}")
+    col2.metric("📉 Classical Risk", f"{c_risk:.6f}")
+    col3.metric("⚖️ Herfindahl (Classical)", f"{herf_c:.4f}")
+    col4.metric("💹 Sharpe Ratio", f"{sharpe_c:.2f}")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("📈 QAOA Return", f"{q_ret:.4f}")
+    col2.metric("📉 QAOA Risk", f"{q_risk:.6f}")
+    col3.metric("⚖️ Herfindahl (QAOA)", f"{herf_q:.4f}")
+    col4.metric("💹 Sharpe Ratio", f"{sharpe_q:.2f}")
+
+    st.divider()
+
+    # Radar Chart for Metrics Comparison
+    metrics_df = pd.DataFrame({
+        "Metric": ["Return", "Risk", "Herfindahl", "Sharpe"],
+        "Classical": [c_ret, c_risk, herf_c, sharpe_c],
+        "QAOA": [q_ret, q_risk, herf_q, sharpe_q]
+    })
+
+    fig_radar = go.Figure()
+    fig_radar.add_trace(go.Scatterpolar(
+        r=metrics_df["Classical"],
+        theta=metrics_df["Metric"],
+        fill='toself',
+        name='Classical'
+    ))
+    fig_radar.add_trace(go.Scatterpolar(
+        r=metrics_df["QAOA"],
+        theta=metrics_df["Metric"],
+        fill='toself',
+        name='QAOA'
+    ))
+    fig_radar.update_layout(
+        polar=dict(radialaxis=dict(visible=True)),
+        showlegend=True,
+        title="📊 Portfolio Metrics Comparison"
+    )
+    st.plotly_chart(fig_radar, use_container_width=True)
+
+    st.divider()
+
+    # Top and Bottom Assets
+    sorted_mu = mu.sort_values(ascending=False)
+    top_assets = sorted_mu.index[:3].tolist()
+    bottom_assets = sorted_mu.index[-3:].tolist()
+
+    st.markdown("### 🚀 Key Observations")
+    st.markdown(f"- **Top Performing Assets:** {', '.join(top_assets)}")
+    st.markdown(f"- **Underperforming Assets:** {', '.join(bottom_assets)}")
+    st.markdown(f"- **Allocation Similarity (Classical vs QAOA):** {sim_val*100:.1f}%")
+    
+    # Optional: Visual gauge for allocation similarity
+    st.markdown("#### 🔄 Allocation Similarity")
+    st.progress(int(sim_val*100))
+    
+with tabs[12]:
+    st.subheader("🧬 Quantum Stability & Sensitivity Analysis")
+
+    st.caption(
+        "This analysis measures how stable the QAOA portfolio is when "
+        "market expectations are slightly perturbed."
+    )
+
+    noise = st.slider(
+        "Market Noise Level (μ perturbation)",
+        0.0, 0.15, 0.05, 0.01,
+        help="Higher values simulate more uncertain markets"
+    )
+
+    runs = st.slider(
+        "Quantum Re-runs",
+        10, 60, 30, 5,
+        help="More runs = stronger stability signal"
+    )
+
+    stability_df = quantum_sensitivity_analysis(
+        mu_q,
+        cov_q,
+        returns_q,
+        reps=reps,
+        budget=budget,
+        noise_level=noise,
+        runs=runs
+    )
+
+    st.subheader("📊 Asset Selection Stability")
+    st.dataframe(
+        stability_df.style.format({
+            "Quantum Selection Probability": "{:.2%}"
+        }),
+        use_container_width=True
+    )
+
+    fig = px.bar(
+        stability_df,
+        x="Asset",
+        y="Quantum Selection Probability",
+        title="Quantum Asset Stability Under Market Noise",
+        color="Quantum Selection Probability",
+        color_continuous_scale="Viridis"
+    )
+
+    fig.update_layout(
+        yaxis_title="Selection Probability",
+        xaxis_title="Asset",
+        template="plotly_white"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    most_stable = stability_df.iloc[0]["Asset"]
+    least_stable = stability_df.iloc[-1]["Asset"]
+
+    st.markdown("### 🧠 Insights")
+    st.markdown(f"- 🟢 **Most Quantum-Stable Asset:** `{most_stable}`")
+    st.markdown(f"- 🔴 **Most Sensitive Asset:** `{least_stable}`")
+    st.markdown(
+        "- Assets with high stability are **robust to market uncertainty**, "
+        "making them ideal long-term quantum selections."
+    )
+
+# Download
+with tabs[13]:
+    latest_prices = prices.iloc[-1]
+    export_df = pd.DataFrame({
         "Asset": mu.index,
-        "Weight ($)": c_weights,
-        "Volume": (c_weights / latest_prices).round(2)
+        "Current Price ($)": latest_prices.values.round(2),
+        "Classical Weight ($)": c_weights.round(2),
+        "QAOA Weight ($)": q_weights.round(2),
+        "Classical Shares": (c_weights / latest_prices).round(2).values,
+        "QAOA Shares": (q_weights / latest_prices).round(2).values
     })
-    qaoa_df = pd.DataFrame({
-        "Asset": mu.index,
-        "Weight ($)": q_weights,
-        "Volume": (q_weights / latest_prices).round(2)
-    })
-    blended_df = pd.DataFrame({
-        "Asset": mu.index,
-        "Weight ($)": blended_weights,
-        "Volume": (blended_weights / latest_prices).round(2)
-    })
-    comparison_df = pd.DataFrame({
-        "Metric": [
-            "Expected Return", "Risk (Variance)", "Sharpe Ratio", "Herfindahl Index", "Allocation Similarity"
-        ],
-        "Classical": [
-            c_ret,
-            c_risk,
-            annualized_sharpe(returns_df.dot(c_weights/budget)),
-            herfindahl_index(c_weights),
-            "-"
-        ],
-        "QAOA": [
-            q_ret,
-            q_risk,
-            annualized_sharpe(returns_df.dot(q_weights/budget)),
-            herfindahl_index(q_weights),
-            "-"
-        ],
-        "Blended": [
-            float(mu.values @ (blended_weights/budget)),
-            float((blended_weights/budget) @ cov.values @ (blended_weights/budget)),
-            annualized_sharpe(returns_df.dot(blended_weights/budget)),
-            herfindahl_index(blended_weights),
-            f"{cosine_similarity(c_weights, q_weights)*100:.1f}%"
-        ]
-    })
-    st.dataframe(blended_df)
+    st.dataframe(export_df)
+    
+    # Excel export
     excel_buffer = BytesIO()
     with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
-        classical_df.to_excel(writer, index=False, sheet_name="Classical Assets")
-        qaoa_df.to_excel(writer, index=False, sheet_name="QAOA Assets")
-        blended_df.to_excel(writer, index=False, sheet_name="Blended Assets")
-        comparison_df.to_excel(writer, index=False, sheet_name="Comparison")
-    st.download_button("📥 Download Excel ", data=excel_buffer.getvalue(), file_name="portfolio_analysis.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_excel_multi")
+        export_df.to_excel(writer, index=False, sheet_name="Portfolio")
+    st.download_button("📥 Download Excel", excel_buffer.getvalue(), "portfolio.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    
+    # PDF export
     pdf_buffer = BytesIO()
     doc = SimpleDocTemplate(pdf_buffer, pagesize=letter)
     styles = getSampleStyleSheet()
-    elements = [Paragraph("Portfolio Report", styles["Title"]), Spacer(1, 12)]
-
-    def add_table(title, df):
-        elements.append(Paragraph(title, styles["Heading2"]))
-        elements.append(Spacer(1, 6))
-        table_data = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
-        table = Table(table_data)
-        table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.gray),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("GRID", (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        elements.append(table)
-        elements.append(Spacer(1, 12))
-
-    add_table("Classical Assets", classical_df)
-    add_table("QAOA Assets", qaoa_df)
-    add_table("Blended Assets", blended_df)
-    add_table("Comparison Summary", comparison_df)
+    elements = [Paragraph("Portfolio Optimization Report", styles["Title"]), Spacer(1, 12)]
+    pdf_data = [export_df.columns.tolist()] + export_df.astype(str).values.tolist()
+    table = Table(pdf_data, hAlign='LEFT')
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.dodgerblue),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
+        ("GRID", (0, 0), (-1, -1), 1, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    elements.append(table)
     doc.build(elements)
-    st.download_button("📄 Download PDF ", data=pdf_buffer.getvalue(), file_name="portfolio_report.pdf", mime="application/pdf", key="download_pdf_multi")
+    st.download_button("📄 Download PDF", pdf_buffer.getvalue(), "portfolio_report.pdf", mime="application/pdf")
